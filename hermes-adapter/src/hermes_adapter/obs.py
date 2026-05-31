@@ -47,6 +47,20 @@ class SpanEmitter:
             span.set_attribute(HarnessAttr.APPROVAL_REQUIRED, approval_required)
             span.set_attribute(HarnessAttr.PROVENANCE_REFS, json.dumps([]))  # wired with memory/retrieval later
 
+    def emit_memory_recall(self, *, query: str, refs: list, parent_ctx=None) -> None:
+        # The grounding trace: using memory leaves harness.provenance.refs on the decision-log,
+        # child of the active turn. Each ref carries its provenance kind + grounded flag, and a
+        # top-level boolean surfaces whether any UNGROUNDED (model-asserted) belief was RECALLED
+        # here — queryable without parsing the refs list. NB it means "recalled", not "grounded
+        # an action": tying a ref to the action it grounded is the deferred ref->action wiring.
+        with self._tracer.start_as_current_span("memory.recall", context=parent_ctx) as span:
+            span.set_attribute(GenAIAttr.OPERATION_NAME, "recall_memory")
+            span.set_attribute(HarnessAttr.PROVENANCE_REFS, json.dumps(refs))
+            span.set_attribute(
+                HarnessAttr.PROVENANCE_RECALLED_UNGROUNDED,
+                any(not r.get("grounded", False) for r in refs),
+            )
+
     def annotate_turn(self, span, *, cost) -> None:
         if cost is not None and cost.amount_usd is not None:
             span.set_attribute(HarnessAttr.COST_USD, float(cost.amount_usd))

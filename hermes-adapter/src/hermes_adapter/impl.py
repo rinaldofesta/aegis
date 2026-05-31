@@ -125,6 +125,7 @@ class HermesAdapter:
         self._gate_policy = gate_policy
         self._approval_callback = approval_callback
         self._active: dict[str, Any] | None = None  # per-turn state (turn_ctx + recorded)
+        self._memory: Any = None  # lazily-built reference MemoryProvider (memoized per adapter)
 
     # --- enforcement (adapter): map a pure GateResult + approval mechanism to an outcome ---
     def _enforce(self, res: GateResult, action: GatedAction):
@@ -363,6 +364,16 @@ class HermesAdapter:
                 )
             results.append(SubagentResult(task=task, turn=turn))
         return results
+
+    def get_memory_provider(self) -> Any:
+        # Reference realization: in-process attributed-belief store whose recall emits the
+        # grounding trace (harness.provenance.refs) under the active turn. One provider per
+        # adapter (memoized). Production backing = Hermes' MemoryManager (memory Stage C).
+        if self._memory is None:
+            from .memory import ReferenceMemory
+
+            self._memory = ReferenceMemory(self._obs, active_getter=lambda: self._active)
+        return self._memory
 
     def emit_observability_event(self, event: Any) -> None:
         self._obs.emit_event(event)

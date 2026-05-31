@@ -45,6 +45,7 @@ class HarnessAttr:
     APPROVAL_POLICY = "harness.approval.policy"       # ApprovalPolicy value
     APPROVAL_REQUIRED = "harness.approval.required"   # bool — block+required=true is the HITL queue
     PROVENANCE_REFS = "harness.provenance.refs"       # list[str] of source refs (JSON-encoded on spans)
+    PROVENANCE_RECALLED_UNGROUNDED = "harness.provenance.recalled_ungrounded"  # bool — a model-asserted belief was RECALLED here; NOT "it grounded an action" (that needs ref->action wiring)
     KILL_REQUESTED = "harness.kill.requested"         # bool
     TENANT_ID = "harness.tenant.id"
     AGENT_ID = "harness.agent.id"

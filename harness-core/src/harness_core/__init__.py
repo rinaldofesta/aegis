@@ -17,7 +17,7 @@ from .hooks import (
     HookRegistry,
     HookResult,
 )
-from .memory import MemoryProvider
+from .memory import MemoryEntry, MemoryProvider, Provenance, ProvenanceKind
 from .observability import (
     HARNESS_ATTR_KEYS,
     GenAIAttr,
@@ -55,6 +55,9 @@ __all__ = [
     "HookRegistry",
     "HookResult",
     "MemoryProvider",
+    "MemoryEntry",
+    "Provenance",
+    "ProvenanceKind",
     "HARNESS_ATTR_KEYS",
     "GenAIAttr",
     "HarnessAttr",
