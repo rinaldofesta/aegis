@@ -1,0 +1,15 @@
+[project]
+name = "aegis"
+version = "0.0.0"
+description = "Aegis (codename) — standardized, domain-swappable autonomous-agent harness."
+requires-python = ">=3.12"
+dependencies = []
+
+# Root is not an installable package — it's the monorepo umbrella.
+# `harness-core` is the only workspace member with a pyproject so far; `hermes-adapter`
+# and `claude-adapter` join the workspace once they have their own pyproject.
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["harness-core"]

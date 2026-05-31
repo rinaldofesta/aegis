@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# uv / venv
+.venv/
+uv.lock
+
+# env / secrets
+.env
+*.local
+
+# OS
+.DS_Store

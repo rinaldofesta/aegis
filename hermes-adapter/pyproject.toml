@@ -1,0 +1,28 @@
+[project]
+name = "hermes-adapter"
+version = "0.1.0"
+description = "Aegis hermes-adapter — implements harness_core.Engine over Hermes."
+requires-python = ">=3.12"
+dependencies = [
+    "harness-core",
+    "hermes-agent",
+    "opentelemetry-sdk>=1.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "openai>=2"]
+
+[tool.uv.sources]
+harness-core = { path = "../harness-core", editable = true }
+hermes-agent = { path = "../../external/hermes-agent", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hermes_adapter"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]

@@ -1,0 +1,39 @@
+"""Tool contracts — MCP as the canonical tool/data protocol.
+
+Tool schemas are MCP-compatible JSON Schema (`inputSchema`), modeled here as plain
+dicts so the core needs no engine/SDK import. The OpenAI-shape <-> MCP normalization
+lives in the ADAPTER, never here (that boundary is what keeps the standard vendor-free).
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Protocol, runtime_checkable
+
+JSONSchema = dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolDef:
+    name: str
+    description: str
+    input_schema: JSONSchema  # MCP `inputSchema` (JSON Schema)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResult:
+    call_id: str
+    content: str
+    is_error: bool = False
+
+
+@runtime_checkable
+class ToolRegistry(Protocol):
+    def list_tools(self) -> list[ToolDef]: ...
+    def get(self, name: str) -> ToolDef | None: ...
