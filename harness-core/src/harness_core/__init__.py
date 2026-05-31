@@ -8,6 +8,7 @@ from __future__ import annotations
 from .agent import Agent, AgentConfig, Turn
 from .cost import CanonicalUsage, CostResult, CostStatus
 from .engine import Engine
+from .gate import GateEvaluator, GatePolicy, GateResult, GateRule, GatedAction
 from .hooks import (
     ApprovalPolicy,
     HookDecision,
@@ -37,6 +38,11 @@ __all__ = [
     "AgentConfig",
     "Turn",
     "Engine",
+    "GatedAction",
+    "GateRule",
+    "GatePolicy",
+    "GateResult",
+    "GateEvaluator",
     "CanonicalUsage",
     "CostResult",
     "CostStatus",

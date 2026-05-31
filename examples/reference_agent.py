@@ -1,9 +1,8 @@
 """Aegis tracer-bullet (runnable).
 
 One real turn through the boundary: harness_core contracts -> hermes-adapter -> Hermes'
-real loop dispatching the typed `echo` tool, with a scripted (mock) model at the raw
-model-output boundary. No creds, no spend. Spans go to an in-memory exporter and are
-printed so the structure is visible.
+real loop dispatching the typed `echo` tool, gated by the core GateEvaluator, with a
+scripted (mock) model at the raw model-output boundary. No creds, no spend.
 
     PYTHONPATH=harness-core/src:hermes-adapter/src python examples/reference_agent.py
 """
@@ -17,7 +16,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from harness_core import AgentConfig, TenantContext
+from harness_core import AgentConfig, ApprovalPolicy, GatePolicy, GateRule, HarnessAttr, TenantContext
 from hermes_adapter import HermesAdapter, ScriptedTransport, SpanEmitter
 from hermes_adapter.echo import ECHO_TOOL, echo_handler
 
@@ -43,6 +42,9 @@ SCRIPTED = [
     }),
 ]
 
+# Explicit policy: echo is auto-approved; everything else falls to a safe deny default.
+POLICY = GatePolicy([GateRule("echo", ApprovalPolicy.AUTO_APPROVE)], default=ApprovalPolicy.AUTO_DENY)
+
 
 def main() -> None:
     exporter = InMemorySpanExporter()
@@ -50,7 +52,7 @@ def main() -> None:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     tracer = provider.get_tracer("aegis.reference")
 
-    adapter = HermesAdapter(SpanEmitter(tracer), model_transport=ScriptedTransport(SCRIPTED))
+    adapter = HermesAdapter(SpanEmitter(tracer), model_transport=ScriptedTransport(SCRIPTED), gate_policy=POLICY)
     adapter.register_tool(ECHO_TOOL, echo_handler)
 
     cfg = AgentConfig(model="gpt-4o-mini", provider_name="openai", system_prompt="bullet",
@@ -67,8 +69,10 @@ def main() -> None:
     by_id = {s.context.span_id: s for s in spans}
     for s in spans:
         parent = by_id.get(s.parent.span_id).name if s.parent else "—"
-        harness_keys = sorted(k for k in s.attributes if k.startswith("harness."))
-        print(f"  - {s.name:5s} parent={parent:5s} harness.*={harness_keys}")
+        gate = s.attributes.get(HarnessAttr.GATE_DECISION)
+        reason = s.attributes.get(HarnessAttr.GATE_REASON)
+        extra = f" gate={gate} reason={reason!r}" if gate else ""
+        print(f"  - {s.name:5s} parent={parent:5s}{extra}")
 
 
 if __name__ == "__main__":

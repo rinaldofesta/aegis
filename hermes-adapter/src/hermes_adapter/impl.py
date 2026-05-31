@@ -1,10 +1,12 @@
 """HermesAdapter — implements harness_core.Engine over Hermes.
 
-This is the ONLY module where Hermes types appear. harness_core stays vendor-free; the
-import-boundary test guarantees nothing here leaks back into it.
+Only module where Hermes types appear. The gate enforcement lives in the tool wrapper (the
+path we fully control); the DECISION comes from the core GateEvaluator. Everything fails
+CLOSED: no policy, an evaluator error, or any unexpected path -> do not execute.
 """
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from typing import Any, Callable
 
@@ -13,9 +15,15 @@ from opentelemetry import trace as _otel_trace
 from harness_core import (
     Agent,
     AgentConfig,
+    ApprovalPolicy,
     CanonicalUsage,
     CostResult,
     CostStatus,
+    GateEvaluator,
+    GatePolicy,
+    GateResult,
+    GatedAction,
+    HookDecision,
     ProviderInfo,
     TenantContext,
     ToolCall,
@@ -50,8 +58,8 @@ def _map_cost(hres: Any) -> CostResult:
 
 
 class ScriptedTransport:
-    """Mock model at the RAW model-output boundary (OpenAI shape). Accumulates usage
-    across every model call so a multi-step turn sums correctly (not under-reported)."""
+    """Mock model at the RAW model-output boundary (OpenAI shape). Accumulates usage across
+    every model call so a multi-step turn sums correctly."""
 
     def __init__(self, responses: list[Any]):
         self._responses = list(responses)
@@ -72,12 +80,10 @@ class ScriptedTransport:
 
 
 class _Handle:
-    """Opaque agent handle satisfying harness_core.Agent (vendor-free consumers use only
-    `session_id`). Holds Hermes-specific state internally."""
+    """Opaque agent handle satisfying harness_core.Agent (consumers use only session_id)."""
 
-    def __init__(self, agent: Any, state: dict[str, Any]):
+    def __init__(self, agent: Any):
         self._agent = agent
-        self._state = state
 
     @property
     def session_id(self) -> str:
@@ -85,24 +91,86 @@ class _Handle:
 
 
 class HermesAdapter:
-    def __init__(self, span_emitter: SpanEmitter, model_transport: Callable[..., Any] | None = None):
+    def __init__(
+        self,
+        span_emitter: SpanEmitter,
+        model_transport: Callable[..., Any] | None = None,
+        gate_policy: GatePolicy | None = None,
+        approval_callback: Callable[[GatedAction], bool] | None = None,
+    ):
         self._obs = span_emitter
         self._transport = model_transport
+        self._gate = GateEvaluator()
+        self._gate_policy = gate_policy
+        self._approval_callback = approval_callback
+        self._active: dict[str, Any] | None = None  # per-turn state (turn_ctx + recorded)
 
-    # --- tool registration: dir.1 normalization (MCP -> OpenAI) ---
+    # --- enforcement (adapter): map a pure GateResult + approval mechanism to an outcome ---
+    def _enforce(self, res: GateResult, action: GatedAction):
+        """Returns (execute, decision, approval_required, reason). Fails closed."""
+        if res.decision == HookDecision.ALLOW:
+            return True, HookDecision.ALLOW, False, res.reason
+        if res.decision == HookDecision.BLOCK:
+            return False, HookDecision.BLOCK, False, res.reason
+        # NEEDS_APPROVAL — asking is enforcement, not evaluation.
+        if self._approval_callback is not None:
+            try:
+                approved = bool(self._approval_callback(action))
+            except Exception as exc:
+                return False, HookDecision.BLOCK, True, (
+                    f"approval callback error: {type(exc).__name__}; fail-closed block"
+                )
+            if approved:
+                return True, HookDecision.ALLOW, True, "approved by approver"
+            return False, HookDecision.BLOCK, True, "approval denied by approver"
+        # No approver -> fail-safe block, BUT mark approval.required: this is the HITL queue
+        # marker (decision=block AND approval.required=true), distinct from a real deny.
+        return False, HookDecision.BLOCK, True, "awaiting approval, no approver"
+
     def register_tool(self, td: ToolDef, handler: Callable[[dict], str], toolset: str = "aegis") -> None:
-        schema = mcp_tooldef_to_openai_function(td)
+        def gated_handler(args: Any, **kwargs: Any) -> str:
+            action = GatedAction(
+                kind="tool",
+                name=td.name,
+                arguments=dict(args) if isinstance(args, dict) else {},
+            )
+            # DECISION (core) — fail closed on no-policy or evaluator error.
+            try:
+                if self._gate_policy is None:
+                    res = GateResult(HookDecision.BLOCK, ApprovalPolicy.AUTO_DENY, None,
+                                     "no gate policy configured; fail-closed block")
+                else:
+                    res = self._gate.evaluate(action, self._gate_policy)
+            except Exception as exc:
+                res = GateResult(HookDecision.BLOCK, ApprovalPolicy.AUTO_DENY, None,
+                                 f"gate evaluation error: {type(exc).__name__}; fail-closed block")
+            execute, decision, approval_required, reason = self._enforce(res, action)
+
+            active = self._active
+            if active is not None:
+                active["recorded"].append(ToolCall(id="", name=td.name, arguments=action.arguments))
+                self._obs.emit_tool_span(
+                    tool_name=td.name,
+                    parent_ctx=active.get("turn_ctx"),
+                    gate_decision=decision.value,
+                    approval_policy=res.policy.value,
+                    approval_required=approval_required,
+                    reason=reason,
+                )
+            if execute:
+                return handler(args)
+            return json.dumps({"blocked": True, "decision": decision.value, "reason": reason})
+
         hermes_registry.register(
             name=td.name,
             toolset=toolset,
-            schema=schema,
-            handler=lambda args, **kw: handler(args),
+            schema=mcp_tooldef_to_openai_function(td),  # dir.1: MCP inputSchema -> OpenAI function
+            handler=lambda args, **kw: gated_handler(args, **kw),
             check_fn=lambda: True,
             description=td.description,
             override=True,
         )
-        # PALETTO #2: positively assert the tool registered — the fail-soft registry could
-        # otherwise swallow a broken registration and leave a green bullet on a missing tool.
+        # PALETTO #2: positively assert registration (fail-soft registry could hide a miss).
         if hermes_registry.get_entry(td.name) is None:
             raise RuntimeError(f"tool {td.name!r} failed to register in Hermes")
 
@@ -110,7 +178,7 @@ class HermesAdapter:
         return ProviderInfo(canonical_name=name, api_mode="chat_completions", supports_tools=True)
 
     def list_tools(self) -> list[ToolDef]:
-        return []  # not exercised by the bullet
+        return []
 
     def dispatch_tool(self, name: str, arguments: dict, context: dict) -> ToolResult:
         out = hermes_registry.dispatch(name, arguments)
@@ -127,20 +195,9 @@ class HermesAdapter:
         return _map_cost(estimate_usage_cost(model, hu, provider=provider))
 
     def spawn_agent(self, config: AgentConfig, tenant: TenantContext) -> Agent:
-        state: dict[str, Any] = {"recorded": [], "turn_ctx": None}
-
-        def on_tool_complete(tc_id: Any, name: Any, args: Any, result: Any) -> None:
-            # Translate Hermes' callback shape into the neutral Turn.tool_calls field —
-            # do NOT let the callback shape leak into Turn.
-            state["recorded"].append(
-                ToolCall(
-                    id=str(tc_id),
-                    name=str(name),
-                    arguments=dict(args) if isinstance(args, dict) else {},
-                )
-            )
-            self._obs.emit_tool_span(tool_name=str(name), parent_ctx=state["turn_ctx"])
-
+        # enabled_toolsets=["aegis"] excludes Hermes built-ins from the operator, so the
+        # gated set (adapter-registered tools) == the set offered to the model. Documented
+        # scope: dispatch-level isolation of built-ins is post-bullet (global registry).
         agent = AIAgent(
             provider=config.provider_name,
             model=config.model,
@@ -153,32 +210,36 @@ class HermesAdapter:
             quiet_mode=True,
             ephemeral_system_prompt=config.system_prompt or "You are an Aegis operator.",
             session_id=config.session_id,
-            tool_complete_callback=on_tool_complete,
         )
         if self._transport is not None:
             agent._disable_streaming = True
             agent._interruptible_api_call = self._transport
-        return _Handle(agent, state)
+        return _Handle(agent)
 
     def run_turn(self, agent: Agent, user_input: str, system_prompt: str | None = None) -> Turn:
         handle: _Handle = agent  # type: ignore[assignment]
         hagent = handle._agent
         model = str(getattr(hagent, "model", "") or "")
         provider = str(getattr(hagent, "provider", "") or "")
-        with self._obs.turn_span(agent_id=handle.session_id, model=model) as turn_span:
-            handle._state["turn_ctx"] = _otel_trace.set_span_in_context(turn_span)
-            text = hagent.chat(user_input)
-            transport = self._transport
-            usage = CanonicalUsage(
-                input_tokens=getattr(transport, "input_tokens", 0),
-                output_tokens=getattr(transport, "output_tokens", 0),
-                request_count=getattr(transport, "calls", 1) or 1,
-            )
-            cost = self.estimate_cost(provider, model, usage)
-            self._obs.annotate_turn(turn_span, cost=cost)
+        self._active = {"turn_ctx": None, "recorded": []}
+        try:
+            with self._obs.turn_span(agent_id=handle.session_id, model=model) as turn_span:
+                self._active["turn_ctx"] = _otel_trace.set_span_in_context(turn_span)
+                text = hagent.chat(user_input)
+                transport = self._transport
+                usage = CanonicalUsage(
+                    input_tokens=getattr(transport, "input_tokens", 0),
+                    output_tokens=getattr(transport, "output_tokens", 0),
+                    request_count=getattr(transport, "calls", 1) or 1,
+                )
+                cost = self.estimate_cost(provider, model, usage)
+                self._obs.annotate_turn(turn_span, cost=cost)
+            recorded = list(self._active["recorded"])
+        finally:
+            self._active = None
         return Turn(
             text=str(text),
-            tool_calls=list(handle._state["recorded"]),
+            tool_calls=recorded,
             usage=usage,
             cost=cost,
             session_id=handle.session_id,

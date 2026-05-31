@@ -41,9 +41,10 @@ class HarnessAttr:
     """
 
     GATE_DECISION = "harness.gate.decision"          # HookDecision value
+    GATE_REASON = "harness.gate.reason"              # WHY the gate decided (decision provenance)
     APPROVAL_POLICY = "harness.approval.policy"       # ApprovalPolicy value
-    APPROVAL_REQUIRED = "harness.approval.required"   # bool
-    PROVENANCE_REFS = "harness.provenance.refs"       # list[str] of source refs
+    APPROVAL_REQUIRED = "harness.approval.required"   # bool — block+required=true is the HITL queue
+    PROVENANCE_REFS = "harness.provenance.refs"       # list[str] of source refs (JSON-encoded on spans)
     KILL_REQUESTED = "harness.kill.requested"         # bool
     TENANT_ID = "harness.tenant.id"
     AGENT_ID = "harness.agent.id"
