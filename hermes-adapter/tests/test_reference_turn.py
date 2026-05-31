@@ -17,6 +17,8 @@ import json
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
 from openai.types.chat import ChatCompletion
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -247,3 +249,20 @@ def test_empty_scope_fails_closed():
     assert handle._agent.valid_tool_names == set()  # sees nothing — fail-closed
     blocked = adapter.dispatch_tool("echo", {"message": "hi"}, {"scope": handle.scope})
     assert blocked.is_error  # nothing in scope -> blocked
+
+
+def test_concurrent_turn_refused_fail_closed():
+    """The gated_handler reads scope from self._active, so a second overlapping turn on one
+    adapter would run under the wrong operator's scope. The re-entrancy guard refuses it
+    (fail-closed) instead of risking a cross-operator execution."""
+    tracer = TracerProvider().get_tracer("aegis.reentry")
+    adapter = HermesAdapter(SpanEmitter(tracer), model_transport=ScriptedTransport(_scripted()),
+                            gate_policy=_ALLOW_ECHO)
+    adapter.register_tool(ECHO_TOOL, echo_handler)
+    cfg = AgentConfig(model="gpt-4o-mini", provider_name="openai", system_prompt="op",
+                      tools=("echo",), extra={"toolsets": ["aegis"]})
+    handle = adapter.spawn_agent(cfg, TenantContext(tenant_id="t", root=Path("/tmp")))
+    # simulate a turn already in flight on this adapter
+    adapter._active = {"turn_ctx": None, "recorded": [], "tool_seq": 0, "scope": handle.scope}
+    with pytest.raises(RuntimeError, match="concurrent/nested"):
+        adapter.run_turn(handle, "echo please")

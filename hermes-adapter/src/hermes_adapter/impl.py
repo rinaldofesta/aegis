@@ -285,6 +285,18 @@ class HermesAdapter:
         hagent = handle._agent
         model = str(getattr(hagent, "model", "") or "")
         provider = str(getattr(hagent, "provider", "") or "")
+        # FAIL-CLOSED re-entrancy guard: the gated_handler reads the operator scope from
+        # self._active, so a second concurrent/nested turn on ONE adapter would make a tool
+        # execute under the WRONG operator's scope (a cross-operator security breach, not just
+        # a visibility glitch). Refuse rather than risk it. The real concurrency fix — one
+        # adapter per operator (out-of-process) or thread-local active-state — is a
+        # SubagentOrchestrator decision; until then, single active turn per adapter is enforced.
+        if self._active is not None:
+            raise RuntimeError(
+                "concurrent/nested run_turn on a single HermesAdapter is unsupported: tool-scope "
+                "binds to self._active. Use one adapter per operator, or make active turn-state "
+                "thread-local before delegating concurrently (SubagentOrchestrator)."
+            )
         self._active = {"turn_ctx": None, "recorded": [], "tool_seq": 0, "scope": handle.scope}
         try:
             with self._obs.turn_span(agent_id=handle.session_id, model=model) as turn_span:
