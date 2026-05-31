@@ -26,6 +26,8 @@ from harness_core import (
     HookDecision,
     ProviderInfo,
     StopReason,
+    SubagentResult,
+    SubagentTask,
     TenantContext,
     ToolCall,
     ToolDef,
@@ -325,6 +327,42 @@ class HermesAdapter:
             cost=cost,
             session_id=handle.session_id,
         )
+
+    def delegate(self, tasks: "Sequence[SubagentTask]", tenant: TenantContext) -> list[SubagentResult]:
+        # INVOCATION MODEL: orchestration is a SEQUENCE OF TURNS — delegate BETWEEN turns,
+        # never nested mid-turn. If a parent turn is active, nesting subagent turns would trip
+        # the re-entrancy guard; fail loud as a DELEGATION error (distinct from a subagent's
+        # own failure, which is returned as an ERROR Turn below).
+        if self._active is not None:
+            raise RuntimeError(
+                "delegate() called during an active turn: orchestration is a sequence of turns, "
+                "not nested mid-turn delegation. Delegate between turns."
+            )
+        # REFERENCE realization: sequential, one active turn at a time — so the run_turn
+        # re-entrancy guard holds and each subagent's scope in self._active stays correct.
+        # Each subagent runs under ITS OWN scope (task.config.tools): delegation inherits the
+        # per-operator isolation for free (it reuses spawn_agent's scoping). Result order
+        # matches task order, but callers correlate by SubagentResult.task, not position.
+        # PRODUCTION (decided): out-of-process workers (one adapter/process) — a clean
+        # kill-switch and OS isolation; deliberately NOT Hermes' in-process ThreadPoolExecutor
+        # delegate_tool (the concurrent shared-state path we rejected).
+        results: list[SubagentResult] = []
+        for task in tasks:
+            try:
+                handle = self.spawn_agent(task.config, tenant)
+                turn = self.run_turn(handle, task.input)
+            except Exception as exc:
+                # PARTIAL FAILURE: a subagent's own error comes back AS a Turn (ERROR) so one
+                # failing specialist never kills the fan-out. delegate() raises only for the
+                # delegation error above, never here.
+                self._active = None  # defensive: run_turn's finally already clears it
+                turn = Turn(
+                    text=f"subagent {task.label or '?'} failed: {type(exc).__name__}: {exc}",
+                    stop_reason=StopReason.ERROR,
+                    raw={"error": str(exc), "error_type": type(exc).__name__},
+                )
+            results.append(SubagentResult(task=task, turn=turn))
+        return results
 
     def emit_observability_event(self, event: Any) -> None:
         self._obs.emit_event(event)

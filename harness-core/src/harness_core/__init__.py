@@ -27,6 +27,7 @@ from .observability import (
     SpanKind,
 )
 from .provider import ProviderInfo, ProviderRegistry
+from .subagent import SubagentOrchestrator, SubagentResult, SubagentTask
 from .task import JobSpec, JobState, JobStatus, TaskScheduler
 from .tenant import TenantContext
 from .tools import JSONSchema, ToolCall, ToolDef, ToolRegistry, ToolResult, ToolScope
@@ -62,6 +63,9 @@ __all__ = [
     "SpanKind",
     "ProviderInfo",
     "ProviderRegistry",
+    "SubagentOrchestrator",
+    "SubagentResult",
+    "SubagentTask",
     "JobSpec",
     "JobState",
     "JobStatus",

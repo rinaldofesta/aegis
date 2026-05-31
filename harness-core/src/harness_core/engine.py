@@ -10,6 +10,7 @@ post-bullet; they are the contracts an adapter must eventually satisfy.
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
 
 from .agent import Agent, AgentConfig, Turn
@@ -18,6 +19,7 @@ from .hooks import HookEvent, HookHandler, HookResult
 from .memory import MemoryProvider
 from .observability import ObservabilityEvent
 from .provider import ProviderInfo
+from .subagent import SubagentResult, SubagentTask
 from .task import JobSpec, JobState
 from .tenant import TenantContext
 from .tools import ToolDef, ToolResult
@@ -41,6 +43,9 @@ class Engine(Protocol):
     def emit_observability_event(self, event: ObservabilityEvent) -> None: ...
 
     # --- post-bullet (declared; implemented once the bullet passes) ---
+    def delegate(
+        self, tasks: Sequence[SubagentTask], tenant: TenantContext
+    ) -> list[SubagentResult]: ...
     def get_memory_provider(self) -> MemoryProvider: ...
     def register_hook_handler(self, event: HookEvent, handler: HookHandler) -> None: ...
     def fire_hook(self, event: HookEvent, context: dict[str, Any]) -> HookResult | None: ...

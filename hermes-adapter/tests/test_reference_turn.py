@@ -33,6 +33,7 @@ from harness_core import (
     GenAIAttr,
     HarnessAttr,
     StopReason,
+    SubagentTask,
     TenantContext,
     ToolDef,
 )
@@ -266,3 +267,92 @@ def test_concurrent_turn_refused_fail_closed():
     adapter._active = {"turn_ctx": None, "recorded": [], "tool_seq": 0, "scope": handle.scope}
     with pytest.raises(RuntimeError, match="concurrent/nested"):
         adapter.run_turn(handle, "echo please")
+
+
+# --- subagent delegation (the 'lead' fanning work to scoped specialists) ---
+
+def _scoped_cfg(prompt: str, tools: tuple) -> AgentConfig:
+    return AgentConfig(model="gpt-4o-mini", provider_name="openai", system_prompt=prompt,
+                       tools=tools, extra={"toolsets": ["aegis"]})
+
+
+def test_delegate_runs_scoped_subagents_in_order():
+    """The orchestrator contract: delegate scoped subagents -> await their Turns, in order.
+    Reference realization is sequential (the re-entrancy guard holds across delegations)."""
+    transport = ScriptedTransport(_scripted() + _scripted())  # 2 subagents x 2 model calls
+    adapter = HermesAdapter(SpanEmitter(TracerProvider().get_tracer("aegis.deleg")),
+                            model_transport=transport, gate_policy=_ALLOW_ECHO)
+    adapter.register_tool(ECHO_TOOL, echo_handler)
+    tasks = [
+        SubagentTask(config=_scoped_cfg("researcher", ("echo",)), input="echo A", label="researcher"),
+        SubagentTask(config=_scoped_cfg("writer", ("echo",)), input="echo B", label="writer"),
+    ]
+    results = adapter.delegate(tasks, TenantContext(tenant_id="t", root=Path("/tmp")))
+    assert len(results) == 2  # one result per task, in order
+    assert results[0].task.label == "researcher"  # explicit coupling, not positional trust
+    assert results[0].turn.text == "Echoed for you."
+    assert all(r.turn.stop_reason == StopReason.COMPLETED for r in results)
+
+
+def test_delegate_isolates_scope_per_subagent():
+    """Each delegated subagent runs under ITS OWN scope, never the parent's: an echo-scoped
+    subagent executes echo; an empty-scope sibling is isolated and cannot."""
+    transport = ScriptedTransport(_scripted() + _scripted())
+    adapter = HermesAdapter(SpanEmitter(TracerProvider().get_tracer("aegis.deleg2")),
+                            model_transport=transport, gate_policy=_ALLOW_ECHO)
+    exec_calls: list = []
+
+    def spy(args):
+        exec_calls.append(args)
+        return echo_handler(args)
+
+    adapter.register_tool(ECHO_TOOL, spy)
+    tasks = [
+        SubagentTask(config=_scoped_cfg("has-echo", ("echo",)), input="echo", label="has-echo"),
+        SubagentTask(config=_scoped_cfg("no-tools", ()), input="echo", label="no-tools"),
+    ]
+    results = adapter.delegate(tasks, TenantContext(tenant_id="t", root=Path("/tmp")))
+    assert len(results) == 2
+    # only the echo-scoped subagent could execute echo; the empty-scope one is isolated
+    assert len(exec_calls) == 1
+
+
+def test_delegate_between_turns_only():
+    """Orchestration is a sequence of turns: delegate() during an active parent turn is
+    refused (nesting would trip the re-entrancy guard) — a DELEGATION error, fail-loud."""
+    adapter = HermesAdapter(SpanEmitter(TracerProvider().get_tracer("aegis.deleg3")),
+                            model_transport=ScriptedTransport(_scripted()), gate_policy=_ALLOW_ECHO)
+    adapter.register_tool(ECHO_TOOL, echo_handler)
+    # simulate a parent turn already in flight
+    adapter._active = {"turn_ctx": None, "recorded": [], "tool_seq": 0, "scope": None}
+    with pytest.raises(RuntimeError, match="active turn"):
+        adapter.delegate([SubagentTask(config=_scoped_cfg("a", ("echo",)), input="x", label="a")],
+                         TenantContext(tenant_id="t", root=Path("/tmp")))
+
+
+def test_delegate_partial_failure_does_not_kill_fanout(monkeypatch):
+    """A subagent's OWN failure comes back AS an ERROR Turn, explicitly coupled to its task;
+    siblings still complete; delegate() does NOT raise on a subagent failure."""
+    adapter = HermesAdapter(SpanEmitter(TracerProvider().get_tracer("aegis.deleg4")),
+                            model_transport=ScriptedTransport(_scripted()), gate_policy=_ALLOW_ECHO)
+    adapter.register_tool(ECHO_TOOL, echo_handler)
+    real_spawn = adapter.spawn_agent
+    n = {"i": 0}
+
+    def flaky_spawn(config, tenant):
+        n["i"] += 1
+        if n["i"] == 1:
+            raise RuntimeError("spawn boom")  # first subagent fails to start
+        return real_spawn(config, tenant)
+
+    monkeypatch.setattr(adapter, "spawn_agent", flaky_spawn)
+    tasks = [
+        SubagentTask(config=_scoped_cfg("alpha", ("echo",)), input="x", label="alpha"),
+        SubagentTask(config=_scoped_cfg("beta", ("echo",)), input="y", label="beta"),
+    ]
+    results = adapter.delegate(tasks, TenantContext(tenant_id="t", root=Path("/tmp")))
+    assert len(results) == 2  # fan-out NOT killed by one failure
+    assert results[0].task.label == "alpha"  # explicit coupling (B)
+    assert results[0].turn.stop_reason == StopReason.ERROR  # failed subagent -> ERROR Turn (A)
+    assert results[1].task.label == "beta"
+    assert results[1].turn.stop_reason == StopReason.COMPLETED  # sibling still ran
