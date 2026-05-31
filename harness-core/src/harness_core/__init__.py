@@ -5,7 +5,7 @@ at the wire level. Adapters (hermes_adapter, claude_adapter) implement `Engine`.
 """
 from __future__ import annotations
 
-from .agent import Agent, AgentConfig, Turn
+from .agent import Agent, AgentConfig, StopReason, Turn
 from .cost import CanonicalUsage, CostResult, CostStatus
 from .engine import Engine
 from .gate import GateEvaluator, GatePolicy, GateResult, GateRule, GatedAction
@@ -36,6 +36,7 @@ __version__ = "0.1.0"
 __all__ = [
     "Agent",
     "AgentConfig",
+    "StopReason",
     "Turn",
     "Engine",
     "GatedAction",

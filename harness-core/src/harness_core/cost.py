@@ -19,14 +19,24 @@ class CostStatus(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class CanonicalUsage:
-    """Provider-agnostic token usage. Adapters normalize their engine's usage to this."""
+    """Provider-agnostic token usage. Adapters normalize their engine's usage to this.
+
+    `output_tokens` counts ALL generated tokens for the turn — reasoning/thinking
+    INCLUDED. This is uniform across engines (Claude folds thinking into output and exposes
+    no separate reasoning count); there is no portable per-category split, so any breakdown
+    belongs in the adapter's `Turn.raw`, not here. Do NOT sum input+output+<reasoning>
+    anywhere — there is no separate reasoning field to double-count.
+
+    `request_count` = the number of real model API calls made during this turn.
+    `None` means unknown — never default to 1 (that would lie), and never map an agentic
+    turn/step count (e.g. Claude's `num_turns`) onto it.
+    """
 
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
-    reasoning_tokens: int = 0
-    request_count: int = 1
+    request_count: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -61,6 +61,7 @@ def main() -> None:
     turn = adapter.run_turn(handle, "Please echo 'pong' twice.")
 
     print("text:        ", turn.text)
+    print("stop_reason: ", turn.stop_reason)
     print("tool_calls:  ", [(c.name, c.arguments) for c in turn.tool_calls])
     print("usage:       ", turn.usage)
     print("cost:        ", turn.cost)

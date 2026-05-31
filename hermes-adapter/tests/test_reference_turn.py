@@ -5,8 +5,9 @@ round-trip; multi-step usage SUM; cost from Hermes' real pricing; span structure
 (tool child-of turn, harness.* placement).
 
 Gate teeth (the moat — enforcement, not labels):
-  - ALLOW policy -> echo executes, span gate.decision="allow".
-  - BLOCK policy -> echo handler is NOT called (execution prevented), span gate.decision="block".
+  - ALLOW policy -> echo executes, span gate.decision="allow", recorded with a real id.
+  - BLOCK policy -> echo handler is NOT called; tool_calls is EXECUTED-only so a blocked
+    call is ABSENT from Turn.tool_calls but its block verdict IS on the decision-log span.
   - UNMATCHED action + safe PROMPT default + no approver -> fail-closed BLOCK with
     approval.required=true (the HITL queue marker), reason "awaiting approval".
 """
@@ -29,6 +30,7 @@ from harness_core import (
     GateRule,
     GenAIAttr,
     HarnessAttr,
+    StopReason,
     TenantContext,
 )
 from hermes_adapter import HermesAdapter, ScriptedTransport, SpanEmitter
@@ -114,11 +116,14 @@ def test_allow_dispatch_usage_and_span_structure():
 
     # dir.2: typed args round-tripped + actually executed
     assert turn.text == "Echoed for you."
+    # stop_reason is REAL — derived from the terminal finish_reason ("stop"), not hardcoded
+    assert turn.stop_reason == StopReason.COMPLETED
     assert len(exec_calls) == 1
     assert len(turn.tool_calls) == 1
     call = turn.tool_calls[0]
     assert call.name == "echo"
     assert call.arguments == {"message": "pong", "times": 2}
+    assert call.id and call.id.startswith("echo")  # real, stable id — never the old ""
 
     # usage summed across BOTH model calls
     assert turn.usage.input_tokens == 31
@@ -149,8 +154,9 @@ def test_block_prevents_execution():
     turn, spans, exec_calls = _run(deny)
     # THE moat tooth: blocked => the real handler never ran
     assert exec_calls == []
-    # the attempt is still recorded (decision-log shows requested-but-blocked)
-    assert len(turn.tool_calls) == 1
+    # executed-only: a blocked call is ABSENT from Turn.tool_calls...
+    assert turn.tool_calls == []
+    # ...but the attempt + its block verdict still live on the decision-log span (the audit).
     toolspan = _tool_span(spans)
     assert toolspan.attributes[HarnessAttr.GATE_DECISION] == "block"
     assert toolspan.attributes[HarnessAttr.APPROVAL_REQUIRED] is False  # a real deny, not awaiting approval
@@ -161,6 +167,7 @@ def test_unmatched_action_fails_closed():
     prompt_default = GatePolicy([], default=ApprovalPolicy.PROMPT)
     turn, spans, exec_calls = _run(prompt_default)
     assert exec_calls == []  # fail closed on the unmatched path
+    assert turn.tool_calls == []  # nothing executed -> nothing in the executed-only list
     toolspan = _tool_span(spans)
     assert toolspan.attributes[HarnessAttr.GATE_DECISION] == "block"
     assert toolspan.attributes[HarnessAttr.APPROVAL_REQUIRED] is True  # the HITL queue marker
@@ -171,6 +178,7 @@ def test_needs_approval_with_approver_executes():
     prompt_default = GatePolicy([GateRule("echo", ApprovalPolicy.PROMPT)], default=ApprovalPolicy.AUTO_DENY)
     turn, spans, exec_calls = _run(prompt_default, approval_callback=lambda action: True)
     assert len(exec_calls) == 1  # approver said yes -> executed
+    assert len(turn.tool_calls) == 1  # approved -> executed -> in the executed-only list
     toolspan = _tool_span(spans)
     assert toolspan.attributes[HarnessAttr.GATE_DECISION] == "allow"
     assert toolspan.attributes[HarnessAttr.APPROVAL_REQUIRED] is True

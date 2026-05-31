@@ -21,6 +21,17 @@ class ToolDef:
 
 @dataclass(frozen=True, slots=True)
 class ToolCall:
+    """A tool call that EXECUTED during a turn.
+
+    `Turn.tool_calls` is EXECUTED-only — "what actually ran". This is the one semantic
+    every engine produces cleanly (Claude: the tool_use the SDK ran; Hermes: the calls
+    that passed the gate). Attempts the gate BLOCKED are NOT here — they live on the
+    action span in the decision-log (`harness.gate.decision="block"`), the single
+    canonical home for that judgement. (The older "attempted-incl-blocked" semantic was a
+    Hermes artifact: it forced a Claude adapter to fake-merge `permission_denials` to
+    reproduce it. Dropped.) `id` is the engine's stable call id — never empty.
+    """
+
     id: str
     name: str
     arguments: dict[str, Any] = field(default_factory=dict)

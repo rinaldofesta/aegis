@@ -25,6 +25,7 @@ from harness_core import (
     GatedAction,
     HookDecision,
     ProviderInfo,
+    StopReason,
     TenantContext,
     ToolCall,
     ToolDef,
@@ -48,6 +49,17 @@ _STATUS = {
 }
 
 
+def _stop_from_finish(finish_reason: str | None) -> StopReason:
+    """Map an OpenAI-shape finish_reason onto the portable StopReason. chat() only returns
+    once the loop sees a terminal stop, so a clean return is COMPLETED unless truncated.
+    (Stage C / real Hermes additionally maps turn_exit_reason; errors -> ERROR upstream.)"""
+    if finish_reason == "length":
+        return StopReason.LENGTH
+    if finish_reason == "content_filter":
+        return StopReason.ERROR
+    return StopReason.COMPLETED
+
+
 def _map_cost(hres: Any) -> CostResult:
     amount = getattr(hres, "amount_usd", None)
     status = _STATUS.get(str(getattr(hres, "status", "unknown")), CostStatus.UNKNOWN)
@@ -67,6 +79,7 @@ class ScriptedTransport:
         self.input_tokens = 0
         self.output_tokens = 0
         self.calls = 0
+        self.last_finish_reason: str | None = None
 
     def __call__(self, api_kwargs: Any, *args: Any, **kwargs: Any) -> Any:
         resp = self._responses[min(self._i, len(self._responses) - 1)]
@@ -76,6 +89,9 @@ class ScriptedTransport:
         if usage is not None:
             self.input_tokens += int(getattr(usage, "prompt_tokens", 0) or 0)
             self.output_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
+        choices = getattr(resp, "choices", None) or []
+        if choices:
+            self.last_finish_reason = getattr(choices[0], "finish_reason", None)
         return resp
 
 
@@ -148,7 +164,11 @@ class HermesAdapter:
 
             active = self._active
             if active is not None:
-                active["recorded"].append(ToolCall(id="", name=td.name, arguments=action.arguments))
+                # The action span is the decision-log: EVERY attempt + its gate verdict
+                # (blocks included). This is the single home for the blocked-vs-executed
+                # judgement, so Turn.tool_calls need not carry it.
+                seq = active["tool_seq"]
+                active["tool_seq"] = seq + 1
                 self._obs.emit_tool_span(
                     tool_name=td.name,
                     parent_ctx=active.get("turn_ctx"),
@@ -157,6 +177,13 @@ class HermesAdapter:
                     approval_required=approval_required,
                     reason=reason,
                 )
+                # Turn.tool_calls is EXECUTED-only ("what ran"): record ONLY when the gate
+                # allows, with a stable non-empty id. Blocked attempts stay on the span
+                # above — not faked into the list (which is what kept Claude portable).
+                if execute:
+                    active["recorded"].append(
+                        ToolCall(id=f"{td.name}#{seq}", name=td.name, arguments=action.arguments)
+                    )
             if execute:
                 return handler(args)
             return json.dumps({"blocked": True, "decision": decision.value, "reason": reason})
@@ -190,7 +217,9 @@ class HermesAdapter:
             output_tokens=usage.output_tokens,
             cache_read_tokens=usage.cache_read_tokens,
             cache_write_tokens=usage.cache_write_tokens,
-            request_count=usage.request_count,
+            # Hermes-internal default: its estimator wants a positive count. Our contract
+            # keeps request_count=None for "unknown"; coalesce only here, not on the Turn.
+            request_count=usage.request_count if usage.request_count is not None else 1,
         )
         return _map_cost(estimate_usage_cost(model, hu, provider=provider))
 
@@ -221,7 +250,7 @@ class HermesAdapter:
         hagent = handle._agent
         model = str(getattr(hagent, "model", "") or "")
         provider = str(getattr(hagent, "provider", "") or "")
-        self._active = {"turn_ctx": None, "recorded": []}
+        self._active = {"turn_ctx": None, "recorded": [], "tool_seq": 0}
         try:
             with self._obs.turn_span(agent_id=handle.session_id, model=model) as turn_span:
                 self._active["turn_ctx"] = _otel_trace.set_span_in_context(turn_span)
@@ -230,8 +259,12 @@ class HermesAdapter:
                 usage = CanonicalUsage(
                     input_tokens=getattr(transport, "input_tokens", 0),
                     output_tokens=getattr(transport, "output_tokens", 0),
-                    request_count=getattr(transport, "calls", 1) or 1,
+                    # real API-call count when known; None ("unknown") when no transport.
+                    request_count=getattr(transport, "calls", None) or None,
                 )
+                # stop_reason is REAL: derived from the model's terminal finish_reason
+                # (not hardcoded). Real Hermes (Stage C) additionally maps turn_exit_reason.
+                stop_reason = _stop_from_finish(getattr(transport, "last_finish_reason", None))
                 cost = self.estimate_cost(provider, model, usage)
                 self._obs.annotate_turn(turn_span, cost=cost)
             recorded = list(self._active["recorded"])
@@ -239,6 +272,7 @@ class HermesAdapter:
             self._active = None
         return Turn(
             text=str(text),
+            stop_reason=stop_reason,
             tool_calls=recorded,
             usage=usage,
             cost=cost,
