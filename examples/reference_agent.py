@@ -56,7 +56,7 @@ def main() -> None:
     adapter.register_tool(ECHO_TOOL, echo_handler)
 
     cfg = AgentConfig(model="gpt-4o-mini", provider_name="openai", system_prompt="bullet",
-                      extra={"toolsets": ["aegis"]})
+                      tools=("echo",), extra={"toolsets": ["aegis"]})  # operator scope: echo only
     handle = adapter.spawn_agent(cfg, TenantContext(tenant_id="t1", root=Path("/tmp")))
     turn = adapter.run_turn(handle, "Please echo 'pong' twice.")
 

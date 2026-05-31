@@ -41,6 +41,7 @@ class AgentConfig:
     provider_name: str
     system_prompt: str | None = None
     session_id: str | None = None
+    tools: tuple[str, ...] = ()  # the operator's tool allowlist (its scope); () = no tools
     extra: dict[str, Any] = field(default_factory=dict)
 
 

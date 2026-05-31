@@ -29,7 +29,7 @@ from .observability import (
 from .provider import ProviderInfo, ProviderRegistry
 from .task import JobSpec, JobState, JobStatus, TaskScheduler
 from .tenant import TenantContext
-from .tools import JSONSchema, ToolCall, ToolDef, ToolRegistry, ToolResult
+from .tools import JSONSchema, ToolCall, ToolDef, ToolRegistry, ToolResult, ToolScope
 
 __version__ = "0.1.0"
 
@@ -72,4 +72,5 @@ __all__ = [
     "ToolDef",
     "ToolRegistry",
     "ToolResult",
+    "ToolScope",
 ]

@@ -30,6 +30,7 @@ from harness_core import (
     ToolCall,
     ToolDef,
     ToolResult,
+    ToolScope,
     Turn,
 )
 
@@ -96,10 +97,12 @@ class ScriptedTransport:
 
 
 class _Handle:
-    """Opaque agent handle satisfying harness_core.Agent (consumers use only session_id)."""
+    """Opaque agent handle satisfying harness_core.Agent (consumers use only session_id).
+    Also carries the operator's ToolScope so the adapter can enforce per-operator isolation."""
 
-    def __init__(self, agent: Any):
+    def __init__(self, agent: Any, scope: ToolScope):
         self._agent = agent
+        self.scope = scope
 
     @property
     def session_id(self) -> str:
@@ -150,19 +153,28 @@ class HermesAdapter:
                 name=td.name,
                 arguments=dict(args) if isinstance(args, dict) else {},
             )
-            # DECISION (core) — fail closed on no-policy or evaluator error.
-            try:
-                if self._gate_policy is None:
-                    res = GateResult(HookDecision.BLOCK, ApprovalPolicy.AUTO_DENY, None,
-                                     "no gate policy configured; fail-closed block")
-                else:
-                    res = self._gate.evaluate(action, self._gate_policy)
-            except Exception as exc:
-                res = GateResult(HookDecision.BLOCK, ApprovalPolicy.AUTO_DENY, None,
-                                 f"gate evaluation error: {type(exc).__name__}; fail-closed block")
-            execute, decision, approval_required, reason = self._enforce(res, action)
-
             active = self._active
+            scope = active.get("scope") if active is not None else None
+            # SCOPE BACKSTOP (defense in depth, fail-closed): an out-of-scope tool never
+            # executes — a harder 'no' than the gate. The primary guard is visibility
+            # (agent.tools); this fires only if something slips past it.
+            if scope is not None and not scope.allows(td.name):
+                res = GateResult(HookDecision.BLOCK, ApprovalPolicy.AUTO_DENY, None,
+                                 f"tool {td.name!r} not in operator scope; out-of-scope block")
+                execute, decision, approval_required, reason = False, HookDecision.BLOCK, False, res.reason
+            else:
+                # DECISION (core) — fail closed on no-policy or evaluator error.
+                try:
+                    if self._gate_policy is None:
+                        res = GateResult(HookDecision.BLOCK, ApprovalPolicy.AUTO_DENY, None,
+                                         "no gate policy configured; fail-closed block")
+                    else:
+                        res = self._gate.evaluate(action, self._gate_policy)
+                except Exception as exc:
+                    res = GateResult(HookDecision.BLOCK, ApprovalPolicy.AUTO_DENY, None,
+                                     f"gate evaluation error: {type(exc).__name__}; fail-closed block")
+                execute, decision, approval_required, reason = self._enforce(res, action)
+
             if active is not None:
                 # The action span is the decision-log: EVERY attempt + its gate verdict
                 # (blocks included). This is the single home for the blocked-vs-executed
@@ -208,8 +220,22 @@ class HermesAdapter:
         return []
 
     def dispatch_tool(self, name: str, arguments: dict, context: dict) -> ToolResult:
+        # Independent dispatch backstop — NOT relying on Hermes' own valid_tool_names check.
+        # Scope comes from the call context, else the active turn; absent or out-of-scope =>
+        # fail-closed refusal, and the tool is NOT dispatched.
+        ctx = context or {}
+        scope = ctx.get("scope")
+        if scope is None and self._active is not None:
+            scope = self._active.get("scope")
+        call_id = str(ctx.get("call_id", ""))
+        if not isinstance(scope, ToolScope) or not scope.allows(name):
+            return ToolResult(
+                call_id=call_id,
+                content=json.dumps({"blocked": True, "reason": f"tool {name!r} out of operator scope"}),
+                is_error=True,
+            )
         out = hermes_registry.dispatch(name, arguments)
-        return ToolResult(call_id=str(context.get("call_id", "")), content=str(out), is_error=False)
+        return ToolResult(call_id=call_id, content=str(out), is_error=False)
 
     def estimate_cost(self, provider: str, model: str, usage: CanonicalUsage) -> CostResult:
         hu = HermesUsage(
@@ -224,9 +250,10 @@ class HermesAdapter:
         return _map_cost(estimate_usage_cost(model, hu, provider=provider))
 
     def spawn_agent(self, config: AgentConfig, tenant: TenantContext) -> Agent:
-        # enabled_toolsets=["aegis"] excludes Hermes built-ins from the operator, so the
-        # gated set (adapter-registered tools) == the set offered to the model. Documented
-        # scope: dispatch-level isolation of built-ins is post-bullet (global registry).
+        # enabled_toolsets=["aegis"] excludes Hermes' built-ins; per-operator ISOLATION is
+        # then enforced below by scoping agent.tools (what the model is offered) down to this
+        # operator's allowlist. The process-global registry is a shared pool, but each
+        # operator sees only its own tools — finance's send_payment is invisible to marketing.
         agent = AIAgent(
             provider=config.provider_name,
             model=config.model,
@@ -240,17 +267,25 @@ class HermesAdapter:
             ephemeral_system_prompt=config.system_prompt or "You are an Aegis operator.",
             session_id=config.session_id,
         )
+        # VISIBILITY (primary guard): offer the model ONLY this operator's tools. Hermes
+        # derives valid_tool_names from agent.tools (its own dispatch check in
+        # conversation_loop), so scoping agent.tools scopes both what is seen AND what
+        # Hermes will route. Fail-closed: an empty allowlist yields zero tools.
+        scope = ToolScope.from_names(config.tools)
+        defs = [t for t in (getattr(agent, "tools", None) or []) if t["function"]["name"] in scope.allowed]
+        agent.tools = defs
+        agent.valid_tool_names = {t["function"]["name"] for t in defs}
         if self._transport is not None:
             agent._disable_streaming = True
             agent._interruptible_api_call = self._transport
-        return _Handle(agent)
+        return _Handle(agent, scope)
 
     def run_turn(self, agent: Agent, user_input: str, system_prompt: str | None = None) -> Turn:
         handle: _Handle = agent  # type: ignore[assignment]
         hagent = handle._agent
         model = str(getattr(hagent, "model", "") or "")
         provider = str(getattr(hagent, "provider", "") or "")
-        self._active = {"turn_ctx": None, "recorded": [], "tool_seq": 0}
+        self._active = {"turn_ctx": None, "recorded": [], "tool_seq": 0, "scope": handle.scope}
         try:
             with self._obs.turn_span(agent_id=handle.session_id, model=model) as turn_span:
                 self._active["turn_ctx"] = _otel_trace.set_span_in_context(turn_span)

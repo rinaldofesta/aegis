@@ -32,6 +32,7 @@ from harness_core import (
     HarnessAttr,
     StopReason,
     TenantContext,
+    ToolDef,
 )
 from hermes_adapter import HermesAdapter, ScriptedTransport, SpanEmitter
 from hermes_adapter.echo import ECHO_TOOL, echo_handler
@@ -87,7 +88,7 @@ def _run(policy: GatePolicy, approval_callback=None):
     )
     adapter.register_tool(ECHO_TOOL, spy)
     cfg = AgentConfig(model="gpt-4o-mini", provider_name="openai",
-                      system_prompt="spike", extra={"toolsets": ["aegis"]})
+                      system_prompt="spike", tools=("echo",), extra={"toolsets": ["aegis"]})
     handle = adapter.spawn_agent(cfg, TenantContext(tenant_id="t1", root=Path("/tmp")))
     turn = adapter.run_turn(handle, "Please echo 'pong' twice.")
     return turn, exporter.get_finished_spans(), exec_calls
@@ -182,3 +183,67 @@ def test_needs_approval_with_approver_executes():
     toolspan = _tool_span(spans)
     assert toolspan.attributes[HarnessAttr.GATE_DECISION] == "allow"
     assert toolspan.attributes[HarnessAttr.APPROVAL_REQUIRED] is True
+
+
+# --- per-operator tool isolation (the multi-operator product invariant) ---
+
+_PAY_TOOL = ToolDef(
+    name="pay",
+    description="Send a payment (finance-only).",
+    input_schema={
+        "type": "object",
+        "properties": {"amount": {"type": "integer", "minimum": 1}},
+        "required": ["amount"],
+        "additionalProperties": False,
+    },
+)
+
+
+def test_operator_tool_isolation():
+    """Two operators share the process-global registry; the marketing operator must NOT
+    see — nor be able to dispatch — finance's `pay`. Visibility (primary, native) plus our
+    own dispatch backstop (independent of Hermes' valid_tool_names check)."""
+    tracer = TracerProvider().get_tracer("aegis.iso")
+    adapter = HermesAdapter(SpanEmitter(tracer), gate_policy=_ALLOW_ECHO)
+    adapter.register_tool(ECHO_TOOL, echo_handler)            # marketing's tool
+
+    pay_calls: list = []
+
+    def pay_handler(args):
+        pay_calls.append(args)
+        return "{}"
+
+    adapter.register_tool(_PAY_TOOL, pay_handler)             # finance's tool, same registry
+
+    # marketing operator — scope is echo only
+    cfg = AgentConfig(model="gpt-4o-mini", provider_name="openai", system_prompt="marketing",
+                      tools=("echo",), extra={"toolsets": ["aegis"]})
+    handle = adapter.spawn_agent(cfg, TenantContext(tenant_id="mkt", root=Path("/tmp")))
+    hagent = handle._agent
+
+    # VISIBILITY (primary, native): the model is offered ONLY echo; pay is invisible AND
+    # absent from Hermes' own dispatch allowlist (valid_tool_names derived from agent.tools).
+    assert hagent.valid_tool_names == {"echo"}
+    assert all(t["function"]["name"] != "pay" for t in (hagent.tools or []))
+
+    # OUR DISPATCH BACKSTOP (independent of Hermes): pay is refused, its handler never runs.
+    blocked = adapter.dispatch_tool("pay", {"amount": 1000}, {"scope": handle.scope})
+    assert blocked.is_error
+    assert pay_calls == []  # the security invariant: marketing cannot reach send-payment
+
+    # in-scope dispatch still works
+    ok = adapter.dispatch_tool("echo", {"message": "hi"}, {"scope": handle.scope})
+    assert not ok.is_error
+
+
+def test_empty_scope_fails_closed():
+    """Allowlist, not denylist: an operator with no declared tools sees and dispatches none."""
+    tracer = TracerProvider().get_tracer("aegis.iso2")
+    adapter = HermesAdapter(SpanEmitter(tracer), gate_policy=_ALLOW_ECHO)
+    adapter.register_tool(ECHO_TOOL, echo_handler)
+    cfg = AgentConfig(model="gpt-4o-mini", provider_name="openai", tools=(),
+                      extra={"toolsets": ["aegis"]})
+    handle = adapter.spawn_agent(cfg, TenantContext(tenant_id="x", root=Path("/tmp")))
+    assert handle._agent.valid_tool_names == set()  # sees nothing — fail-closed
+    blocked = adapter.dispatch_tool("echo", {"message": "hi"}, {"scope": handle.scope})
+    assert blocked.is_error  # nothing in scope -> blocked
