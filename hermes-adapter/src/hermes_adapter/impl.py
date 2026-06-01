@@ -56,9 +56,11 @@ def _stop_from_finish(finish_reason: str | None) -> StopReason:
     """Map an OpenAI-shape finish_reason onto the portable StopReason. chat() only returns
     once the loop sees a terminal stop, so a clean return is COMPLETED unless truncated.
     (Stage C / real Hermes additionally maps turn_exit_reason; errors -> ERROR upstream.)"""
-    if finish_reason == "length":
+    # OpenAI: stop|length|content_filter|tool_calls. Anthropic: end_turn|max_tokens|tool_use|
+    # stop_sequence|refusal. Map truncation/error; everything else is a clean finish.
+    if finish_reason in ("length", "max_tokens"):
         return StopReason.LENGTH
-    if finish_reason == "content_filter":
+    if finish_reason in ("content_filter", "refusal"):
         return StopReason.ERROR
     return StopReason.COMPLETED
 
@@ -95,6 +97,40 @@ class ScriptedTransport:
         choices = getattr(resp, "choices", None) or []
         if choices:
             self.last_finish_reason = getattr(choices[0], "finish_reason", None)
+        return resp
+
+
+class PassthroughTransport:
+    """Stage C: the REAL model at the same raw boundary as the mock. Wraps Hermes' original
+    `_interruptible_api_call` (real HTTP to the provider) and accumulates usage/finish from
+    the REAL ChatCompletion responses — so run_turn reads usage/cost/stop_reason identically,
+    with no need to dig into Hermes' internal accounting. Swap mock->real = swap the transport."""
+
+    def __init__(self, inner: Callable[..., Any]):
+        self._inner = inner
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.calls = 0
+        self.last_finish_reason: str | None = None
+
+    def __call__(self, api_kwargs: Any, *args: Any, **kwargs: Any) -> Any:
+        resp = self._inner(api_kwargs, *args, **kwargs)
+        self.calls += 1
+        # Shape-tolerant: OpenAI uses usage.prompt/completion_tokens; Anthropic raw uses
+        # usage.input/output_tokens. Read whichever is present.
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            self.input_tokens += int(getattr(usage, "prompt_tokens", 0) or getattr(usage, "input_tokens", 0) or 0)
+            self.output_tokens += int(getattr(usage, "completion_tokens", 0) or getattr(usage, "output_tokens", 0) or 0)
+        # finish: OpenAI choices[0].finish_reason; NormalizedResponse.finish_reason; Anthropic stop_reason.
+        fr = None
+        choices = getattr(resp, "choices", None) or []
+        if choices:
+            fr = getattr(choices[0], "finish_reason", None)
+        if fr is None:
+            fr = getattr(resp, "finish_reason", None) or getattr(resp, "stop_reason", None)
+        if fr is not None:
+            self.last_finish_reason = fr
         return resp
 
 
@@ -262,7 +298,7 @@ class HermesAdapter:
             model=config.model,
             api_key=str(config.extra.get("api_key", "sk-aegis-mock")),
             base_url=str(config.extra.get("base_url", "https://api.openai.com/v1")),
-            api_mode="chat_completions",
+            api_mode=str(config.extra.get("api_mode", "chat_completions")),
             enabled_toolsets=list(config.extra.get("toolsets", ["aegis"])),
             skip_context_files=True,
             skip_memory=True,
@@ -279,8 +315,14 @@ class HermesAdapter:
         agent.tools = defs
         agent.valid_tool_names = {t["function"]["name"] for t in defs}
         if self._transport is not None:
+            # mock: scripted transport injected at the raw model-output boundary
             agent._disable_streaming = True
             agent._interruptible_api_call = self._transport
+        else:
+            # Stage C (real): wrap Hermes' ORIGINAL call so we read REAL usage/finish at the
+            # same boundary as the mock. Force non-streaming for clean ChatCompletion+usage.
+            agent._disable_streaming = True
+            agent._interruptible_api_call = PassthroughTransport(agent._interruptible_api_call)
         return _Handle(agent, scope)
 
     def run_turn(self, agent: Agent, user_input: str, system_prompt: str | None = None) -> Turn:
@@ -305,16 +347,27 @@ class HermesAdapter:
             with self._obs.turn_span(agent_id=handle.session_id, model=model) as turn_span:
                 self._active["turn_ctx"] = _otel_trace.set_span_in_context(turn_span)
                 text = hagent.chat(user_input)
-                transport = self._transport
+                # read usage/finish from the agent's patched transport — the SAME object for
+                # mock (ScriptedTransport) and real (PassthroughTransport), so this unifies both.
+                transport = getattr(hagent, "_interruptible_api_call", None)
                 usage = CanonicalUsage(
                     input_tokens=getattr(transport, "input_tokens", 0),
                     output_tokens=getattr(transport, "output_tokens", 0),
                     # real API-call count when known; None ("unknown") when no transport.
                     request_count=getattr(transport, "calls", None) or None,
                 )
-                # stop_reason is REAL: derived from the model's terminal finish_reason
-                # (not hardcoded). Real Hermes (Stage C) additionally maps turn_exit_reason.
-                stop_reason = _stop_from_finish(getattr(transport, "last_finish_reason", None))
+                # stop_reason: if the transport OBSERVED zero successful model responses
+                # (calls == 0 — e.g. every API attempt 404'd and Hermes degraded by returning
+                # the error AS turn text), the turn ERRORED — report it honestly. This guards
+                # the (already-frozen) orchestrator partial-failure invariant: a failed turn
+                # must NEVER read as COMPLETED, or "failed subagent -> ERROR" is hollow.
+                # OBSERVED-zero only: an unknown count (None) is NOT an error (None == 0 is False).
+                # KNOWN NARROWER GAP: a failure WITH >=1 call that Hermes packages as successful
+                # text still reads COMPLETED — needs Hermes' failed/partial flags (deferred).
+                if getattr(transport, "calls", None) == 0:
+                    stop_reason = StopReason.ERROR
+                else:
+                    stop_reason = _stop_from_finish(getattr(transport, "last_finish_reason", None))
                 cost = self.estimate_cost(provider, model, usage)
                 self._obs.annotate_turn(turn_span, cost=cost)
             recorded = list(self._active["recorded"])

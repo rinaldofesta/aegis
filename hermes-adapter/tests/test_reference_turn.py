@@ -97,6 +97,39 @@ def _run(policy: GatePolicy, approval_callback=None):
     return turn, exporter.get_finished_spans(), exec_calls
 
 
+class _ZeroSuccessTransport:
+    """Simulates Hermes degrading a TOTAL API failure: text comes back, but the transport
+    OBSERVED zero successful model responses (calls stays 0) — as when every attempt 404'd."""
+
+    def __init__(self):
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.calls = 0  # deliberately never incremented: zero successes observed
+        self.last_finish_reason = None
+
+    def __call__(self, api_kwargs, *a, **k):
+        return _resp({
+            "id": "err", "object": "chat.completion", "created": 0, "model": "x",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                "role": "assistant", "content": "API call failed after retries: HTTP 404"}}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        })
+
+
+def test_errored_turn_maps_to_error_stop_reason():
+    """Observed-zero successful model responses -> StopReason.ERROR (not COMPLETED). Guards the
+    orchestrator's partial-failure invariant: a failed turn must never read as completed."""
+    adapter = HermesAdapter(SpanEmitter(TracerProvider().get_tracer("aegis.err")),
+                            model_transport=_ZeroSuccessTransport(), gate_policy=_ALLOW_ECHO)
+    adapter.register_tool(ECHO_TOOL, echo_handler)
+    cfg = AgentConfig(model="gpt-4o-mini", provider_name="openai", system_prompt="x",
+                      tools=("echo",), extra={"toolsets": ["aegis"]})
+    handle = adapter.spawn_agent(cfg, TenantContext(tenant_id="t", root=Path("/tmp")))
+    turn = adapter.run_turn(handle, "anything")
+    assert turn.stop_reason == StopReason.ERROR     # observed-zero successes -> errored, not completed
+    assert turn.usage.request_count is None         # no successful request observed
+
+
 def _tool_span(spans):
     return next(s for s in spans if s.name == "tool")
 
