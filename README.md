@@ -1,12 +1,8 @@
-# Aegis (codename)
+# Aegis
 
-Standardized, domain-swappable **autonomous-agent harness**. Born from a reverse
-engineering of Polsia — the thesis: *specialized verticalized agents in a standardized
-harness beat one generalist agent*, and **every action is observable, gated and
-provenance-tracked** (the failures of Polsia were, at root, observability + control
-failures).
-
-> Codename only. **Not** "Hiveloom" (a separate product). Final product name TBD.
+Standardized, domain-swappable **autonomous-agent harness**. The thesis: *specialized
+verticalized agents in a standardized harness beat one generalist agent*, and
+**every action is observable, gated and provenance-tracked**.
 
 ## Architecture
 
