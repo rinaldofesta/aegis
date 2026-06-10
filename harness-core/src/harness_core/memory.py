@@ -1,7 +1,7 @@
 """Memory provider contract — an archive of ATTRIBUTED BELIEFS, not a key-value store.
 
-The anti-Polsia pillar. Observability records WHAT happened; provenance records WHAT a
-belief was grounded ON. Polsia's sin was not acting — it was asserting the unfounded as
+The provenance pillar. Observability records WHAT happened; provenance records WHAT a
+belief was grounded ON. The failure this guards against is not acting — it is asserting the unfounded as
 fact. So every memory entry carries explicit provenance, READING memory leaves a grounding
 trace (`harness.provenance.refs` on the span), and "asserted-by-the-model-without-a-source"
 is a VISIBLE provenance category — never silently equal to a grounded fact.
@@ -28,7 +28,7 @@ class ProvenanceKind(str, Enum):
     — the verbatim retrieval result, the tool's actual output, what the user said — NOT the
     model's SYNTHESIS over them. A conclusion the model draws *from* a tool output is
     MODEL_ASSERTED (honestly ungrounded), never TOOL_OUTPUT: labelling a synthesis as
-    directly-sourced is exactly Polsia's lie. The fail-closed downgrade in `Provenance.make`
+    directly-sourced is exactly the failure this pillar exists to prevent. The fail-closed downgrade in `Provenance.make`
     covers "no source"; THIS guard covers "has a source but is a derivation" — it can only be
     a contract obligation on the writer, not machine-checkable.
 

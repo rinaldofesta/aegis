@@ -1,4 +1,4 @@
-"""Memory = an archive of ATTRIBUTED beliefs (the anti-Polsia provenance pillar).
+"""Memory = an archive of ATTRIBUTED beliefs (the provenance pillar).
 
 Teeth: (1) a 'grounded' kind with no source fails CLOSED to MODEL_ASSERTED; (2) an
 ungrounded belief stays a VISIBLE category on recall (not silently grounded); (3) recall
